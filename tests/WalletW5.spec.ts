@@ -22,7 +22,6 @@ import {
     EmulationError,
     SandboxContract,
     SendMessageResult,
-    internal,
     TreasuryContract
 } from '@ton/sandbox';
 import { KeyPair, getSecureRandomBytes, keyPairFromSeed } from '@ton/crypto';
@@ -1255,7 +1254,7 @@ describe('Wallet v5 external tests', () => {
                 });
             });
             // Doesn't make much sense, since inderectly tested in too many places
-            it.skip('empty action list should increase seqno', async () => {
+            it('empty action list should increase seqno', async () => {
                 const seqNo = await wallet.getSeqno();
                 const testMsg = WalletV5Test.requestMessage(
                     false,
@@ -1265,7 +1264,7 @@ describe('Wallet v5 external tests', () => {
                     {},
                     keys.secretKey
                 );
-                const res = await wallet.sendExternalSignedMessage(testMsg);
+                await wallet.sendExternalSignedMessage(testMsg);
 
                 expect(await wallet.getSeqno()).toEqual(seqNo + 1);
             });
@@ -1295,7 +1294,7 @@ describe('Wallet v5 external tests', () => {
                 const randomBody = beginCell().storeUint(curTime(), 64).endCell();
                 const seqNo = BigInt(await wallet.getSeqno());
 
-                const res = await assertSendMessages(
+                await assertSendMessages(
                     0,
                     walletId,
                     curTime() + 1000,
@@ -1523,36 +1522,52 @@ describe('Wallet v5 external tests', () => {
                 assertInternal(res.transactions, owner.address, 0);
                 expect(await wallet.getSeqno()).toEqual(seqNo + 1);
             });
-            it('should ignore internal message with correct prefix, but incorrect length', async () => {
+            it('should ignore message if length less than required for signature check', async () => {
                 const seqNo = await wallet.getSeqno();
-                // So we have message with bad wallet id
+                // So we have unsigned message
                 const badMsg = WalletV5Test.requestMessage(
                     true,
-                    walletId - 1n,
+                    walletId,
                     curTime() + 1000,
                     BigInt(seqNo),
-                    {},
-                    keys.secretKey
+                    {}
                 );
 
-                // Now we have it's truncated version
-                const msgTrunc = beginCell()
-                    .storeBits(badMsg.beginParse().loadBits(badMsg.bits.length - 10))
-                    .endCell(); // off by one
+                const ds = badMsg.beginParse();
+                // action bits preceeding signature
+                // It's malformed, yet it is possible to check signature
+                const offByTwo = beginCell()
+                    .storeBits(ds.preloadBits(badMsg.bits.length - 2))
+                    .endCell();
+                // This however means that error is in the main body wallet_id, seqno, valid_untill
+                // So this should be ignored
+                // However, in a perfect world prefix + signature length should be the only requirement
+                const offByThree = beginCell()
+                    .storeBits(ds.preloadBits(badMsg.bits.length - 3))
+                    .endCell();
 
                 let res = await wallet.sendInternalSignedMessage(owner.getSender(), {
                     value: toNano('1'),
-                    body: msgTrunc
+                    body: WalletV5Test.signRequestMessage(offByTwo, keys.secretKey)
                 });
-                // Now, because it's truncated it gets ignored
-                assertInternal(res.transactions, owner.address, 0);
-
+                // Should fail and bounce
+                expect(res.transactions).toHaveTransaction({
+                    on: wallet.address,
+                    op: Opcodes.auth_signed_internal,
+                    aborted: true,
+                    outMessagesCount: 1
+                });
                 res = await wallet.sendInternalSignedMessage(owner.getSender(), {
                     value: toNano('1'),
-                    body: badMsg
+                    body: WalletV5Test.signRequestMessage(offByThree, keys.secretKey)
                 });
-                assertInternal(res.transactions, owner.address, ErrorsV5.invalid_wallet_id);
-                // If we send it as is, the subwallet exception will trigger
+                // Goes into sand now
+                expect(res.transactions).toHaveTransaction({
+                    on: wallet.address,
+                    op: Opcodes.auth_signed_internal,
+                    aborted: false,
+                    outMessagesCount: 0
+                });
             });
             it('should be able to send up to 255 messages', async () => {
                 let testMsgs: MessageOut[] = new Array(255);
@@ -2152,14 +2167,6 @@ describe('Wallet v5 external tests', () => {
                         if (!Address.isAddress(args.extra.new_address)) {
                             throw new TypeError('Callback requires wallet address');
                         }
-                        const reqMsg = WalletV5Test.requestMessage(
-                            true,
-                            args.walletId,
-                            args.valid_until,
-                            args.seqno,
-                            args.actions,
-                            args.key
-                        );
                         const res = await wallet.sendExtensionActions(
                             testExtensionBc.getSender(),
                             args.actions
@@ -2592,7 +2599,6 @@ describe('Wallet v5 external tests', () => {
         });
     });
     describe('Signature auth', () => {
-        type OwnerArguments = { walletId: bigint; seqno: number | bigint; key: Buffer };
         let signatureDisabled: BlockchainSnapshot;
         let signatureEnabled: BlockchainSnapshot;
         let multipleExtensions: BlockchainSnapshot;
@@ -2775,7 +2781,6 @@ describe('Wallet v5 external tests', () => {
         it('extension should be able to add another extension when sig auth is disabled', async () => {
             await loadFrom(signatureDisabled);
             const testExtAddr = randomAddress();
-            const stateBefore = await getWalletData();
             const extBefore = await wallet.getExtensionsArray();
             expect(extBefore.length).toBe(1);
 
@@ -2865,6 +2870,87 @@ describe('Wallet v5 external tests', () => {
             });
 
             expect(await getWalletData()).toEqualCell(stateBefore);
+        });
+        it('should be able to withdraw funds on deploy with sig auth disabled', async () => {
+            let newWalletId: bigint;
+
+            do {
+                newWalletId = BigInt(getRandomInt(0, 10000));
+            } while (newWalletId == walletId);
+
+            let seqNo = 0;
+            const badWallet = blockchain.openContract(
+                WalletV5Test.createFromConfig(
+                    {
+                        walletId: newWalletId,
+                        seqno: seqNo,
+                        publicKey: keys.publicKey,
+                        signatureAllowed: false, // That's what we're testing. That's pretty much an incorrect deployment
+                        extensions: Dictionary.empty() // If one supplies non empty dictionary here, you're cooked.
+                    },
+                    code
+                )
+            );
+
+            let res = await badWallet.sendDeploy(owner.getSender(), toNano('100'));
+            expect(res.transactions).toHaveTransaction({
+                on: badWallet.address,
+                aborted: false,
+                deploy: true
+            });
+            // Normally that would lock funds, because owner can only auth himself via signatur
+
+            const sendOut: MessageOut[] = [
+                {
+                    message: internal_relaxed({
+                        to: owner.address,
+                        value: toNano('10')
+                    }),
+                    mode: SendMode.PAY_GAS_SEPARATELY | SendMode.IGNORE_ERRORS
+                }
+            ];
+
+            res = await badWallet.sendMessagesInternal(
+                owner.getSender(),
+                newWalletId,
+                curTime() + 100,
+                seqNo,
+                keys.secretKey,
+                sendOut
+            );
+            expect(res.transactions).toHaveTransaction({
+                on: badWallet.address,
+                op: Opcodes.auth_signed_internal,
+                aborted: false,
+                outMessagesCount: 1
+            });
+            expect(res.transactions).toHaveTransaction({
+                on: owner.address,
+                from: badWallet.address,
+                value: toNano('10')
+            });
+            expect(await badWallet.getSeqno()).toEqual(++seqNo);
+
+            res = await badWallet.sendMessagesExternal(
+                newWalletId,
+                curTime() + 100,
+                seqNo,
+                keys.secretKey,
+                sendOut
+            );
+
+            expect(res.transactions).toHaveTransaction({
+                on: badWallet.address,
+                op: Opcodes.auth_signed,
+                aborted: false,
+                outMessagesCount: 1
+            });
+            expect(res.transactions).toHaveTransaction({
+                on: owner.address,
+                from: badWallet.address,
+                value: toNano('10')
+            });
+            expect(await badWallet.getSeqno()).toEqual(++seqNo);
         });
     });
 });
